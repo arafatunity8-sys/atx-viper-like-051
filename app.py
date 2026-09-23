@@ -22,7 +22,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 current_batch_indices = {}
 batch_indices_lock = threading.Lock()
 
-def get_next_batch_tokens(server_name, all_tokens):
+def get_next_batch_tokens(batch_key, all_tokens):
     if not all_tokens:
         return []
     
@@ -33,10 +33,10 @@ def get_next_batch_tokens(server_name, all_tokens):
         return all_tokens
     
     with batch_indices_lock:
-        if server_name not in current_batch_indices:
-            current_batch_indices[server_name] = 0
+        if batch_key not in current_batch_indices:
+            current_batch_indices[batch_key] = 0
         
-        current_index = current_batch_indices[server_name]
+        current_index = current_batch_indices[batch_key]
         
         # Calculate the batch
         start_index = current_index
@@ -51,11 +51,11 @@ def get_next_batch_tokens(server_name, all_tokens):
         
         # Update the index for next time
         next_index = (current_index + TOKEN_BATCH_SIZE) % total_tokens
-        current_batch_indices[server_name] = next_index
+        current_batch_indices[batch_key] = next_index
         
         return batch_tokens
 
-def get_random_batch_tokens(server_name, all_tokens):
+def get_random_batch_tokens(batch_key, all_tokens):
     """Alternative method: use random sampling for better distribution"""
     if not all_tokens:
         return []
@@ -67,43 +67,57 @@ def get_random_batch_tokens(server_name, all_tokens):
         return all_tokens.copy()
     
     # Randomly select tokens without replacement
-    return random.sample(all_tokens, TOKEN_BATCH_SIZE)
+    return random.sample(all_tokens, min(TOKEN_BATCH_SIZE, total_tokens))
+
+def resolve_token_file(region_param, server_name):
+    """Resolve token file dynamically based on region or mapped server name"""
+    reg_clean = str(region_param).strip().lower()
+    server_clean = str(server_name).strip().lower()
+    candidates = [
+        f"token_{reg_clean}.json",
+        f"token_{server_clean}.json",
+        f"token_{reg_clean.upper()}.json",
+        f"token_{server_clean.upper()}.json",
+    ]
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+
+    for c in unique_candidates:
+        if os.path.exists(c):
+            return c
+    return unique_candidates[0]
 
 _token_cache = {}
 
-def load_tokens(server_name, for_visit=False):
-    cache_key = (server_name, for_visit)
-    if cache_key in _token_cache:
-        return _token_cache[cache_key]
-
-    if for_visit:
-        if server_name == "IND":
-            path = "token_ind_visit.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br_visit.json"
-        else:
-            path = "token_bd_visit.json"
-    else:
-        if server_name == "IND":
-            path = "token_ind.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
-        else:
-            path = "token_bd.json"
+def load_tokens(region_param, server_name):
+    """Load tokens from region-specific token file (e.g. token_bd.json, token_ind.json)"""
+    path = resolve_token_file(region_param, server_name)
+    if not os.path.exists(path):
+        print(f"Token file '{path}' not found for region '{region_param}'.")
+        return [], path
 
     try:
-        with open(path, "r") as f:
+        mtime = os.path.getmtime(path)
+        cache_key = (path, mtime)
+        if cache_key in _token_cache:
+            return _token_cache[cache_key], path
+
+        with open(path, "r", encoding="utf-8") as f:
             tokens = json.load(f)
             if isinstance(tokens, list) and all(isinstance(t, dict) and "token" in t for t in tokens):
-                print(f"Loaded {len(tokens)} tokens from {path} for server {server_name}")
+                print(f"Loaded {len(tokens)} tokens from {path} for region '{region_param}' (server '{server_name}')")
                 _token_cache[cache_key] = tokens
-                return tokens
+                return tokens, path
             else:
-                return []
-    except FileNotFoundError:
-        return []
-    except json.JSONDecodeError:
-        return []
+                print(f"Warning: {path} is not a valid list of token objects.")
+                return [], path
+    except Exception as e:
+        print(f"Error reading token file {path}: {e}")
+        return [], path
 
 def encrypt_message(plaintext):
     key = b'Yg&tc%DEuh6%Zc^8'
@@ -231,15 +245,28 @@ def decode_protobuf_profile_info(binary_data):
 app = Flask(__name__)
 
 # API Key Configuration
-# Default key is 'ag', you can add more keys to this set or use the API_KEYS environment variable (comma-separated)
 VALID_API_KEYS = {
     "ag",
 }
-env_keys = os.environ.get("API_KEYS", "")
-if env_keys:
-    VALID_API_KEYS.update(k.strip() for k in env_keys.split(",") if k.strip())
-if os.environ.get("API_KEY"):
-    VALID_API_KEYS.add(os.environ.get("API_KEY").strip())
+
+def reload_api_keys():
+    keys = set(VALID_API_KEYS)
+    env_keys = os.environ.get("API_KEYS", "")
+    if env_keys:
+        keys.update(k.strip() for k in env_keys.split(",") if k.strip())
+    if os.environ.get("API_KEY"):
+        keys.add(os.environ.get("API_KEY").strip())
+    if os.path.exists("api_keys.json"):
+        try:
+            with open("api_keys.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and "key" in item:
+                            keys.add(str(item["key"]).strip())
+        except Exception:
+            pass
+    return keys
 
 REGION_MAP = {
     "BD": "BD",
@@ -253,32 +280,58 @@ REGION_MAP = {
     "USA": "US",
     "SAC": "SAC",
     "NA": "NA",
+    "SG": "SG",
+    "SINGAPORE": "SG",
+    "PK": "PK",
+    "PAKISTAN": "PK",
+    "ID": "ID",
+    "INDONESIA": "ID",
+    "RU": "RU",
+    "RUSSIA": "RU",
+    "ME": "ME",
+    "VN": "VN",
+    "VIETNAM": "VN",
+    "TH": "TH",
+    "THAILAND": "TH",
+    "TW": "TW",
+    "TAIWAN": "TW",
+    "EU": "EU",
+    "EUROPE": "EU",
 }
 
 @app.route('/', methods=['GET'])
 def index():
+    if request.args.get("uid"):
+        return handle_requests()
     return jsonify({
         "status": "online",
         "message": "Free Fire Like API is running",
-        "usage": "/{uid}/{region}/{api_key}",
+        "usage": "/{uid}/{region}/{key}",
         "example": "/1312746262/bd/ag"
     })
 
 @app.route('/<uid>/<region>/<api_key>', methods=['GET'])
+@app.route('/<uid>/<region>/<api_key>/', methods=['GET'])
+@app.route('/<uid>/<region>', methods=['GET'])
+@app.route('/<uid>/<region>/', methods=['GET'])
 @app.route('/like/<uid>/<region>/<api_key>', methods=['GET'])
+@app.route('/like/<uid>/<region>/<api_key>/', methods=['GET'])
+@app.route('/like/<uid>/<region>', methods=['GET'])
+@app.route('/like/<uid>/<region>/', methods=['GET'])
 @app.route('/like', methods=['GET'])
 def handle_requests(uid=None, region=None, api_key=None):
     uid_param = uid or request.args.get("uid")
     region_param = region or request.args.get("region") or request.args.get("server_name")
-    api_key_param = api_key or request.args.get("api_key") or request.args.get("key")
+    api_key_param = api_key or request.args.get("key") or request.args.get("api_key")
     use_random = request.args.get("random", "false").lower() == "true"
 
     if not api_key_param:
         return jsonify({"status": 0, "error": "API key is required"}), 401
 
     clean_key = str(api_key_param).strip()
-    valid_keys_lower = {k.lower() for k in VALID_API_KEYS}
-    if clean_key not in VALID_API_KEYS and clean_key.lower() not in valid_keys_lower:
+    valid_keys = reload_api_keys()
+    valid_keys_lower = {k.lower() for k in valid_keys}
+    if clean_key not in valid_keys and clean_key.lower() not in valid_keys_lower:
         return jsonify({"status": 0, "error": "Invalid API key"}), 403
 
     if not uid_param or not region_param:
@@ -287,34 +340,34 @@ def handle_requests(uid=None, region=None, api_key=None):
     if not str(uid_param).isdigit():
         return jsonify({"status": 0, "error": "UID must be numeric"}), 400
 
-    server_name_param = REGION_MAP.get(str(region_param).strip().upper(), str(region_param).strip().upper())
+    reg_upper = str(region_param).strip().upper()
+    server_name_param = REGION_MAP.get(reg_upper, reg_upper)
 
-    # Load visit token for profile checking
-    visit_tokens = load_tokens(server_name_param, for_visit=True)
-    if not visit_tokens:
-        return jsonify({"error": f"No visit tokens loaded for server {server_name_param}."}), 500
-    
-    # Use the first visit token for profile check
-    visit_token = visit_tokens[0] if visit_tokens else None
-    
-    # Load regular tokens for like sending
-    all_available_tokens = load_tokens(server_name_param, for_visit=False)
+    # Load tokens dynamically based on region (e.g. token_bd.json, token_ind.json)
+    all_available_tokens, token_file = load_tokens(region_param, server_name_param)
     if not all_available_tokens:
-        return jsonify({"error": f"No tokens loaded or token file invalid for server {server_name_param}."}), 500
+        return jsonify({
+            "status": 0,
+            "error": f"No tokens found in '{token_file}' for region '{region_param}'."
+        }), 500
 
-    print(f"Total tokens available for {server_name_param}: {len(all_available_tokens)}")
+    print(f"Total tokens available for {region_param} ({server_name_param}) from {token_file}: {len(all_available_tokens)}")
+
+    # Use first token from selected region token file for profile check
+    visit_token = all_available_tokens[0]
 
     # Get the batch of tokens for like sending
+    batch_key = token_file
     if use_random:
-        tokens_for_like_sending = get_random_batch_tokens(server_name_param, all_available_tokens)
-        print(f"Using RANDOM batch selection for {server_name_param}")
+        tokens_for_like_sending = get_random_batch_tokens(batch_key, all_available_tokens)
+        print(f"Using RANDOM batch selection from {token_file}")
     else:
-        tokens_for_like_sending = get_next_batch_tokens(server_name_param, all_available_tokens)
-        print(f"Using ROTATING batch selection for {server_name_param}")
+        tokens_for_like_sending = get_next_batch_tokens(batch_key, all_available_tokens)
+        print(f"Using ROTATING batch selection from {token_file}")
     
     encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
     
-    # Get likes BEFORE using visit token
+    # Get likes BEFORE using visit token from region tokens
     before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
     before_like_count = 0
     
@@ -334,7 +387,7 @@ def handle_requests(uid=None, region=None, api_key=None):
         like_api_url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
     if tokens_for_like_sending:
-        print(f"Using token batch for {server_name_param} (size {len(tokens_for_like_sending)}) to send likes.")
+        print(f"Using token batch from {token_file} for {server_name_param} (size {len(tokens_for_like_sending)}) to send likes.")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -344,7 +397,7 @@ def handle_requests(uid=None, region=None, api_key=None):
     else:
         print(f"Skipping like sending for UID {uid_param} as no tokens available for like sending.")
         
-    # Get likes AFTER using visit token
+    # Get likes AFTER using visit token from region tokens
     after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
     after_like_count = before_like_count
     actual_player_uid_from_profile = int(uid_param)
@@ -372,24 +425,31 @@ def handle_requests(uid=None, region=None, api_key=None):
         "PlayerNickname": player_nickname_from_profile,
         "UID": actual_player_uid_from_profile,
         "status": request_status,
-        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
+        "token_file": token_file,
+        "total_tokens": len(all_available_tokens),
+        "tokens_used": len(tokens_for_like_sending),
+        "Note": f"Used tokens from {token_file} ({'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens)."
     }
     return jsonify(response_data)
 
 @app.route('/token_info', methods=['GET'])
 def token_info():
-    """Endpoint to check token counts for each server"""
-    servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
+    """Endpoint to check token counts for each available region token file"""
+    import glob
     info = {}
-    
-    for server in servers:
-        regular_tokens = load_tokens(server, for_visit=False)
-        visit_tokens = load_tokens(server, for_visit=True)
-        info[server] = {
-            "regular_tokens": len(regular_tokens),
-            "visit_tokens": len(visit_tokens)
-        }
-    
+    for filepath in sorted(glob.glob("token_*.json")):
+        filename = os.path.basename(filepath)
+        if filename.endswith("_visit.json"):
+            continue
+        region_name = filename[len("token_"):-len(".json")]
+        try:
+            tokens, _ = load_tokens(region_name, region_name.upper())
+            info[region_name] = {
+                "file": filename,
+                "token_count": len(tokens)
+            }
+        except Exception:
+            pass
     return jsonify(info)
 
 if __name__ == '__main__':
